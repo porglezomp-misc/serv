@@ -1,15 +1,49 @@
 extern crate time;
 
-use std::io::{Write, BufRead, BufReader};
+use std::error::Error;
+use std::io;
+use std::io::{Read, Write, BufRead, BufReader};
 use std::time::Duration;
+use std::convert::From;
 use std::net::{TcpListener, TcpStream};
+use std::fs::File;
+use std::path::{Path, PathBuf, Component};
 use std::thread;
+
+#[derive(Debug)]
+enum UriError {
+    NotFound,
+    IllegalPath,
+}
+
+fn find_file(uri: &str) -> Result<File, UriError> {
+    let path = Path::new(uri);
+    let mut clean_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !clean_path.pop() {
+                    return Err(UriError::IllegalPath);
+                }
+            }
+            Component::Normal(name) => {
+                clean_path.push(name);
+            }
+            _ => {}
+        }
+    }
+    if clean_path.is_dir() {
+        Err(UriError::NotFound)
+    } else {
+        File::open(clean_path).or(Err(UriError::NotFound))
+    }
+}
 
 fn current_time_string() -> String {
     time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
 }
 
-fn head(stream: &mut TcpStream, body_length: usize) {
+fn head(stream: &mut TcpStream, body_length: usize) -> io::Result<()> {
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
@@ -19,10 +53,11 @@ fn head(stream: &mut TcpStream, body_length: usize) {
                            \r\n",
                           current_time_string(),
                           body_length);
-    let _ = stream.write(message.as_bytes());
+    try!(stream.write(message.as_bytes()));
+    Ok(())
 }
 
-fn not_allowed(stream: &mut TcpStream) {
+fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
     let message = format!("HTTP/1.1 405 Method Not Allowed\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
@@ -31,38 +66,88 @@ fn not_allowed(stream: &mut TcpStream) {
                            Content-Length: 0\r\n\
                            \r\n",
                           current_time_string());
-    let _ = stream.write(message.as_bytes());
+    try!(stream.write(message.as_bytes()));
+    Ok(())
 }
 
-fn handle_client(stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+fn not_found(stream: &mut TcpStream, uri: &str) -> io::Result<()> {
+    let body = format!("Resource '{}' not found", uri);
+    let message = format!("HTTP/1.1 404 Not Found\r\n\
+                           Date: {}\r\n\
+                           Connection: close\r\n\
+                           Server: Rust Serv/0.1\r\n\
+                           Content-Length: {}\r\n\
+                           \r\n\
+                           {}",
+                          current_time_string(),
+                          body.len(),
+                          body);
+    try!(stream.write(message.as_bytes()));
+    Ok(())
+}
+
+fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
+    let message = format!("HTTP/1.1 403 Not Permitted\r\n\
+                           Date: {}\r\n\
+                           Connection: close\r\n\
+                           Server: Rust Serv/0.1\r\n\
+                           Content-Length: 0\r\n\
+                           \r\n",
+                          current_time_string());
+    try!(stream.write(message.as_bytes()));
+    Ok(())
+}
+
+fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
+    try!(stream.set_read_timeout(Some(Duration::from_secs(5))));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let _ = reader.read_line(&mut line);
+    try!(reader.read_line(&mut line));
 
     let items = line.split_whitespace().collect::<Vec<_>>();
     if items.len() < 3 {
-        return;
+        return Err(From::from("Not enough items in HTTP request line!"));
     }
 
     let protocol = items[2];
     if protocol != "HTTP/1.1" {
-        return;
+        return Err(From::from(format!("Unsupported protocol {}", protocol)));
     }
 
     let mut stream = reader.into_inner();
 
     let method = items[0];
     match method {
-        "HEAD" | "GET" => { }
-        _ => not_allowed(&mut stream),
+        "HEAD" | "GET" => {}
+        _ => {
+            try!(not_allowed(&mut stream));
+            return Err(From::from(format!("Method {} not allowed", method)));
+        }
     }
 
     let uri = items[1];
-    head(&mut stream, uri.len());
-    if method == "GET" {
-        let _ = stream.write(uri.as_bytes());
+    let file = find_file(uri);
+    match file {
+        Ok(mut file) => {
+            if method == "GET" {
+                let mut data = Vec::new();
+                let length = try!(file.read_to_end(&mut data));
+                try!(head(&mut stream, length));
+                try!(stream.write(&data[..]));
+            } else if method == "HEAD" {
+                try!(head(&mut stream, try!(file.metadata()).len() as usize));
+            } else {
+                return Err(From::from(format!("Unsure how to respond to method {}", method)));
+            }
+        }
+        Err(UriError::NotFound) => {
+            try!(not_found(&mut stream, uri));
+        }
+        Err(UriError::IllegalPath) => {
+            try!(not_permitted(&mut stream));
+        }
     }
+    Ok(())
 }
 
 fn main() {
@@ -70,7 +155,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_client(stream));
+                thread::spawn(move || handle_client(stream).map_err(|e| println!("{:?}", e)));
             }
             Err(e) => {
                 println!("Connection failed! {}", e);
