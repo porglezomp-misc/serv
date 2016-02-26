@@ -1,7 +1,6 @@
 extern crate time;
 
-use std::str;
-use std::io::{Read, Write, ErrorKind};
+use std::io::{Write, BufRead, BufReader};
 use std::time::Duration;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -10,7 +9,7 @@ fn current_time_string() -> String {
     time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
 }
 
-fn head(stream: &mut TcpStream, body: &[u8]) {
+fn head(stream: &mut TcpStream, body_length: usize) {
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
@@ -19,7 +18,7 @@ fn head(stream: &mut TcpStream, body: &[u8]) {
                            Content-Length: {}\r\n\
                            \r\n",
                           current_time_string(),
-                          body.len());
+                          body_length);
     let _ = stream.write(message.as_bytes());
 }
 
@@ -35,32 +34,34 @@ fn not_allowed(stream: &mut TcpStream) {
     let _ = stream.write(message.as_bytes());
 }
 
-fn handle_client(mut stream: TcpStream) {
+fn handle_client(stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut data = [0; 4];
-    match stream.read(&mut data) {
-        Ok(_) => {
-            let body = "Hello, World!";
-            match str::from_utf8(&data) {
-                Ok("HEAD") => {
-                    head(&mut stream, body.as_bytes());
-                }
-                Ok("GET ") => {
-                    head(&mut stream, body.as_bytes());
-                    let _ = stream.write(body.as_bytes());
-                }
-                Ok(_) => {
-                    not_allowed(&mut stream);
-                }
-                _ => return,
-            }
-        }
-        Err(e) => {
-            match e.kind() {
-                ErrorKind::TimedOut | ErrorKind::WouldBlock => return,
-                _ => panic!("{}", e),
-            }
-        }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+
+    let items = line.split_whitespace().collect::<Vec<_>>();
+    if items.len() < 3 {
+        return;
+    }
+
+    let protocol = items[2];
+    if protocol != "HTTP/1.1" {
+        return;
+    }
+
+    let mut stream = reader.into_inner();
+
+    let method = items[0];
+    match method {
+        "HEAD" | "GET" => { }
+        _ => not_allowed(&mut stream),
+    }
+
+    let uri = items[1];
+    head(&mut stream, uri.len());
+    if method == "GET" {
+        let _ = stream.write(uri.as_bytes());
     }
 }
 
