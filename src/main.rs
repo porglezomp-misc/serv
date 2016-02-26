@@ -6,7 +6,7 @@ use std::io::{Read, Write, BufRead, BufReader};
 use std::time::Duration;
 use std::convert::From;
 use std::net::{TcpListener, TcpStream};
-use std::fs::File;
+use std::fs::{File, read_dir};
 use std::path::{Path, PathBuf, Component};
 use std::thread;
 
@@ -51,13 +51,7 @@ fn current_time_string() -> String {
     time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
 }
 
-fn head(stream: &mut TcpStream, name: &str, body_length: usize) -> io::Result<()> {
-    let path = Path::new(name);
-    let content_type = match path.extension().and_then(|x| x.to_str()) {
-        Some("html") | Some("htm") => "text/html",
-        Some("json") => "application/json",
-        _ => "text/plain",
-    };
+fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::Result<()> {
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
@@ -146,20 +140,53 @@ fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
         Ok(file) => {
             let mut data = Vec::new();
 
-            let length = match file {
-                ResponseItem::File(mut file) => match method {
-                    "GET" => try!(file.read_to_end(&mut data)),
-                    "HEAD" => try!(file.metadata()).len() as usize,
-                    _ => unreachable!(),
-                },
-                ResponseItem::Directory(dir) => {
-                    let index = format!("Index for {}", dir.to_str().expect("Expected a path"));
-                    data.extend_from_slice(index.as_bytes());
-                    data.len()
-                },
+            let path = Path::new(uri);
+            let mut content_type = match path.extension().and_then(|x| x.to_str()) {
+                Some("html") | Some("htm") => "text/html",
+                Some("json") => "application/json",
+                _ => "text/plain",
             };
 
-            try!(head(&mut stream, uri, length));
+            let length = match file {
+                ResponseItem::File(mut file) => {
+                    match method {
+                        "GET" => try!(file.read_to_end(&mut data)),
+                        "HEAD" => try!(file.metadata()).len() as usize,
+                        _ => unreachable!(),
+                    }
+                }
+                ResponseItem::Directory(dir) => {
+                    let members = try!(read_dir(&dir));
+                    let items = members.filter_map(|file| {
+                        file.ok().and_then(|file| file.path().to_str().map(String::from))
+                    });
+                    let items = items.map(|path| {
+                        format!(r#"<li><a href="{path}">{name}</a></li>"#,
+                                name = if path.starts_with("./") {
+                                    &path[2..]
+                                } else {
+                                    &path[..]
+                                },
+                                path = if path.starts_with("./") {
+                                    &path[1..]
+                                } else {
+                                    &path[..]
+                                })
+                    });
+                    let items = items.collect::<Vec<_>>().concat();
+                    let content = format!("<html><head><title>{path}</title></head>\
+                                           <body>Index for {path}\
+                                           <ul>{items}</ul>\
+                                           </body></html>",
+                                          path = dir.to_str().unwrap(),
+                                          items = items);
+                    content_type = "text/html";
+                    data.extend_from_slice(content.as_bytes());
+                    data.len()
+                }
+            };
+
+            try!(head(&mut stream, content_type, length));
             if method == "GET" {
                 try!(stream.write(&data[..]));
             }
