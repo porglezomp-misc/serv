@@ -16,9 +16,15 @@ enum UriError {
     IllegalPath,
 }
 
-fn find_file(uri: &str) -> Result<File, UriError> {
+#[derive(Debug)]
+enum ResponseItem {
+    File(File),
+    Directory(PathBuf),
+}
+
+fn find_file(uri: &str) -> Result<ResponseItem, UriError> {
     let path = Path::new(uri);
-    let mut clean_path = PathBuf::new();
+    let mut clean_path = PathBuf::from(".");
     for component in path.components() {
         match component {
             Component::ParentDir => {
@@ -33,9 +39,11 @@ fn find_file(uri: &str) -> Result<File, UriError> {
         }
     }
     if clean_path.is_dir() {
-        Err(UriError::NotFound)
+        Ok(ResponseItem::Directory(clean_path))
     } else {
-        File::open(clean_path).or(Err(UriError::NotFound))
+        File::open(clean_path)
+            .or(Err(UriError::NotFound))
+            .map(|f| ResponseItem::File(f))
     }
 }
 
@@ -43,15 +51,22 @@ fn current_time_string() -> String {
     time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
 }
 
-fn head(stream: &mut TcpStream, body_length: usize) -> io::Result<()> {
+fn head(stream: &mut TcpStream, name: &str, body_length: usize) -> io::Result<()> {
+    let path = Path::new(name);
+    let content_type = match path.extension().and_then(|x| x.to_str()) {
+        Some("html") | Some("htm") => "text/html",
+        Some("json") => "application/json",
+        _ => "text/plain",
+    };
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
                            Server: Rust Serv/0.1\r\n\
-                           Content-Type: text/plain\r\n\
+                           Content-Type: {}\r\n\
                            Content-Length: {}\r\n\
                            \r\n",
                           current_time_string(),
+                          content_type,
                           body_length);
     try!(stream.write(message.as_bytes()));
     Ok(())
@@ -128,16 +143,25 @@ fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
     let uri = items[1];
     let file = find_file(uri);
     match file {
-        Ok(mut file) => {
+        Ok(file) => {
+            let mut data = Vec::new();
+
+            let length = match file {
+                ResponseItem::File(mut file) => match method {
+                    "GET" => try!(file.read_to_end(&mut data)),
+                    "HEAD" => try!(file.metadata()).len() as usize,
+                    _ => unreachable!(),
+                },
+                ResponseItem::Directory(dir) => {
+                    let index = format!("Index for {}", dir.to_str().expect("Expected a path"));
+                    data.extend_from_slice(index.as_bytes());
+                    data.len()
+                },
+            };
+
+            try!(head(&mut stream, uri, length));
             if method == "GET" {
-                let mut data = Vec::new();
-                let length = try!(file.read_to_end(&mut data));
-                try!(head(&mut stream, length));
                 try!(stream.write(&data[..]));
-            } else if method == "HEAD" {
-                try!(head(&mut stream, try!(file.metadata()).len() as usize));
-            } else {
-                return Err(From::from(format!("Unsure how to respond to method {}", method)));
             }
         }
         Err(UriError::NotFound) => {
