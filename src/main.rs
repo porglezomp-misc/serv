@@ -13,7 +13,7 @@ use std::fs::{File, read_dir};
 use std::path::{Path, PathBuf, Component};
 use std::thread;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum UriError {
     NotFound,
     IllegalPath,
@@ -25,9 +25,27 @@ enum ResponseItem {
     Directory(PathBuf),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Method {
+    Get,
+    Head,
+}
+
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
     print!("{}", opts.usage(&brief));
+}
+
+fn content_type_for(uri: &str) -> &str {
+    match Path::new(uri).extension().and_then(|x| x.to_str()) {
+        Some("html") | Some("htm") => "text/html",
+        Some("json") => "application/json",
+        _ => "text/plain",
+    }
+}
+
+fn current_time_string() -> String {
+    time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
 }
 
 fn find_file(uri: &str) -> Result<ResponseItem, UriError> {
@@ -55,10 +73,6 @@ fn find_file(uri: &str) -> Result<ResponseItem, UriError> {
     }
 }
 
-fn current_time_string() -> String {
-    time::strftime("%a, %d %b %Y %H:%M:%S %Z", &time::now()).unwrap()
-}
-
 fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::Result<()> {
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
@@ -70,8 +84,7 @@ fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::R
                           current_time_string(),
                           content_type,
                           body_length);
-    try!(stream.write(message.as_bytes()));
-    Ok(())
+    stream.write(message.as_bytes()).and(Ok(()))
 }
 
 fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
@@ -83,8 +96,7 @@ fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
                            Content-Length: 0\r\n\
                            \r\n",
                           current_time_string());
-    try!(stream.write(message.as_bytes()));
-    Ok(())
+    stream.write(message.as_bytes()).and(Ok(()))
 }
 
 fn not_found(stream: &mut TcpStream, uri: &str) -> io::Result<()> {
@@ -99,8 +111,7 @@ fn not_found(stream: &mut TcpStream, uri: &str) -> io::Result<()> {
                           current_time_string(),
                           body.len(),
                           body);
-    try!(stream.write(message.as_bytes()));
-    Ok(())
+    stream.write(message.as_bytes()).and(Ok(()))
 }
 
 fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
@@ -111,8 +122,7 @@ fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
                            Content-Length: 0\r\n\
                            \r\n",
                           current_time_string());
-    try!(stream.write(message.as_bytes()));
-    Ok(())
+    stream.write(message.as_bytes()).and(Ok(()))
 }
 
 fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
@@ -133,80 +143,78 @@ fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
 
     let mut stream = reader.into_inner();
 
-    let method = items[0];
-    match method {
-        "HEAD" | "GET" => {}
+    let method = match items[0] {
+        "HEAD" => Method::Head,
+        "GET" => Method::Get,
         _ => {
             try!(not_allowed(&mut stream));
-            return Err(From::from(format!("Method {} not allowed", method)));
+            return Err(From::from(format!("Method {} not allowed", items[0])));
         }
-    }
+    };
 
     let uri = items[1];
+    respond_to(&mut stream, method, uri)
+}
+
+fn respond_file(mut stream: &mut TcpStream,
+                uri: &str,
+                file: &mut File,
+                method: Method)
+                -> Result<(), Box<Error>> {
+    let mut data = Vec::new();
+    let length = match method {
+        Method::Get => try!(file.read_to_end(&mut data)),
+        Method::Head => try!(file.metadata()).len() as usize,
+    };
+
+    let content_type = content_type_for(&uri);
+    try!(head(&mut stream, content_type, length));
+    if method == Method::Get {
+        try!(stream.write(&data[..]));
+    }
+    Ok(())
+}
+
+fn respond_directory(mut stream: &mut TcpStream,
+                     dir: &Path,
+                     method: Method)
+                     -> Result<(), Box<Error>> {
+    let members = try!(read_dir(&dir));
+    let items = members.filter_map(|file| {
+        file.ok().and_then(|file| file.path().to_str().map(String::from))
+    });
+    let items = items.map(|path| {
+        format!(r#"<li><a href="{path}">{name}</a></li>"#,
+                name = path.trim_left_matches("./"),
+                path = path.trim_left_matches("."))
+    });
+    let items = items.collect::<Vec<_>>().concat();
+    let content = format!("<html><head><title>{path}</title></head>\
+                           <body>Index for {path}\
+                           <ul>{items}</ul>\
+                           </body></html>",
+                          path = dir.to_str().unwrap(),
+                          items = items);
+
+    try!(head(&mut stream, "text/html", content.len()));
+    if method == Method::Get {
+        try!(stream.write(content.as_bytes()));
+    }
+    Ok(())
+}
+
+fn respond_to(mut stream: &mut TcpStream, method: Method, uri: &str) -> Result<(), Box<Error>> {
     let file = find_file(uri);
     match file {
         Ok(file) => {
-            let mut data = Vec::new();
-
-            let path = Path::new(uri);
-            let mut content_type = match path.extension().and_then(|x| x.to_str()) {
-                Some("html") | Some("htm") => "text/html",
-                Some("json") => "application/json",
-                _ => "text/plain",
-            };
-
-            let length = match file {
-                ResponseItem::File(mut file) => {
-                    match method {
-                        "GET" => try!(file.read_to_end(&mut data)),
-                        "HEAD" => try!(file.metadata()).len() as usize,
-                        _ => unreachable!(),
-                    }
-                }
-                ResponseItem::Directory(dir) => {
-                    let members = try!(read_dir(&dir));
-                    let items = members.filter_map(|file| {
-                        file.ok().and_then(|file| file.path().to_str().map(String::from))
-                    });
-                    let items = items.map(|path| {
-                        format!(r#"<li><a href="{path}">{name}</a></li>"#,
-                                name = if path.starts_with("./") {
-                                    &path[2..]
-                                } else {
-                                    &path[..]
-                                },
-                                path = if path.starts_with("./") {
-                                    &path[1..]
-                                } else {
-                                    &path[..]
-                                })
-                    });
-                    let items = items.collect::<Vec<_>>().concat();
-                    let content = format!("<html><head><title>{path}</title></head>\
-                                           <body>Index for {path}\
-                                           <ul>{items}</ul>\
-                                           </body></html>",
-                                          path = dir.to_str().unwrap(),
-                                          items = items);
-                    content_type = "text/html";
-                    data.extend_from_slice(content.as_bytes());
-                    data.len()
-                }
-            };
-
-            try!(head(&mut stream, content_type, length));
-            if method == "GET" {
-                try!(stream.write(&data[..]));
+            match file {
+                ResponseItem::File(mut file) => respond_file(&mut stream, uri, &mut file, method),
+                ResponseItem::Directory(dir) => respond_directory(&mut stream, &dir, method),
             }
         }
-        Err(UriError::NotFound) => {
-            try!(not_found(&mut stream, uri));
-        }
-        Err(UriError::IllegalPath) => {
-            try!(not_permitted(&mut stream));
-        }
+        Err(UriError::NotFound) => Ok(try!(not_found(&mut stream, uri))),
+        Err(UriError::IllegalPath) => Ok(try!(not_permitted(&mut stream))),
     }
-    Ok(())
 }
 
 fn main() {
@@ -219,10 +227,7 @@ fn main() {
                 "set the port for the server (default 8000)",
                 "PORT");
     opts.optflag("h", "help", "print this help menu");
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => panic!(f.to_string()),
-    };
+    let matches = opts.parse(&args[1..]).unwrap();
 
     if matches.opt_present("h") {
         print_usage(&program, opts);
