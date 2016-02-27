@@ -1,5 +1,8 @@
 extern crate time;
+extern crate getopts;
 
+use getopts::Options;
+use std::env;
 use std::error::Error;
 use std::io;
 use std::io::{Read, Write, BufRead, BufReader};
@@ -20,6 +23,11 @@ enum UriError {
 enum ResponseItem {
     File(File),
     Directory(PathBuf),
+}
+
+fn print_usage(program: &str, opts: Options) {
+    let brief = format!("Usage: {} [options]", program);
+    print!("{}", opts.usage(&brief));
 }
 
 fn find_file(uri: &str) -> Result<ResponseItem, UriError> {
@@ -55,7 +63,7 @@ fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::R
     let message = format!("HTTP/1.1 200 OK\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
-                           Server: Rust Serv/0.1\r\n\
+                           Server: Rust Serv/0.1.1\r\n\
                            Content-Type: {}\r\n\
                            Content-Length: {}\r\n\
                            \r\n",
@@ -70,7 +78,7 @@ fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
     let message = format!("HTTP/1.1 405 Method Not Allowed\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
-                           Server: Rust Serv/0.1\r\n\
+                           Server: Rust Serv/0.1.1\r\n\
                            Allow: GET, HEAD\r\n\
                            Content-Length: 0\r\n\
                            \r\n",
@@ -84,7 +92,7 @@ fn not_found(stream: &mut TcpStream, uri: &str) -> io::Result<()> {
     let message = format!("HTTP/1.1 404 Not Found\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
-                           Server: Rust Serv/0.1\r\n\
+                           Server: Rust Serv/0.1.1\r\n\
                            Content-Length: {}\r\n\
                            \r\n\
                            {}",
@@ -99,7 +107,7 @@ fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
     let message = format!("HTTP/1.1 403 Not Permitted\r\n\
                            Date: {}\r\n\
                            Connection: close\r\n\
-                           Server: Rust Serv/0.1\r\n\
+                           Server: Rust Serv/0.1.1\r\n\
                            Content-Length: 0\r\n\
                            \r\n",
                           current_time_string());
@@ -202,11 +210,35 @@ fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
 }
 
 fn main() {
-    let listener = TcpListener::bind("127.0.0.1:8000").unwrap();
+    let args: Vec<_> = env::args().collect();
+    let program = args[0].clone();
+
+    let mut opts = Options::new();
+    opts.optopt("p",
+                "port",
+                "set the port for the server (default 8000)",
+                "PORT");
+    opts.optflag("h", "help", "print this help menu");
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(f) => panic!(f.to_string()),
+    };
+
+    if matches.opt_present("h") {
+        print_usage(&program, opts);
+        return;
+    }
+
+    let port = matches.opt_str("p").and_then(|x| x.parse::<i32>().ok()).unwrap_or(8000);
+
+    let address = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&address[..]).unwrap();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_client(stream).map_err(|e| println!("{:?}", e)));
+                thread::spawn(move || {
+                    handle_client(stream).map_err(|e| println!("{}", e.description()))
+                });
             }
             Err(e) => {
                 println!("Connection failed! {}", e);

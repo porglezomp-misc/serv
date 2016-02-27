@@ -1,7 +1,8 @@
 [package]
 name = "serv"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Caleb Jones <self@calebjones.net>"]
 
 [dependencies]
 time = "0.1"
+getopts = "0.2"
