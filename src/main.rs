@@ -73,56 +73,42 @@ fn find_file(uri: &str) -> Result<ResponseItem, UriError> {
     }
 }
 
-fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::Result<()> {
-    let message = format!("HTTP/1.1 200 OK\r\n\
-                           Date: {}\r\n\
-                           Connection: close\r\n\
-                           Server: Rust Serv/0.1.1\r\n\
-                           Content-Type: {}\r\n\
-                           Content-Length: {}\r\n\
-                           \r\n",
-                          current_time_string(),
-                          content_type,
-                          body_length);
-    stream.write(message.as_bytes()).and(Ok(()))
-}
-
-fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
-    let message = format!("HTTP/1.1 405 Method Not Allowed\r\n\
-                           Date: {}\r\n\
+fn respond_header(stream: &mut TcpStream,
+                  status: &str,
+                  content_type: &str,
+                  body_length: usize)
+                  -> io::Result<()> {
+    let message = format!("HTTP/1.1 {status}\r\n\
+                           Date: {date}\r\n\
                            Connection: close\r\n\
                            Server: Rust Serv/0.1.1\r\n\
                            Allow: GET, HEAD\r\n\
-                           Content-Length: 0\r\n\
+                           Content-Type: {content_type}\r\n\
+                           Content-Length: {length}\r\n\
                            \r\n",
-                          current_time_string());
+                          status = status,
+                          date = current_time_string(),
+                          content_type = content_type,
+                          length = body_length);
     stream.write(message.as_bytes()).and(Ok(()))
+}
+
+fn head(stream: &mut TcpStream, content_type: &str, body_length: usize) -> io::Result<()> {
+    respond_header(stream, "200 OK", content_type, body_length)
+}
+
+fn not_allowed(stream: &mut TcpStream) -> io::Result<()> {
+    respond_header(stream, "405 Method Not Allowed", "text/plain", 0)
 }
 
 fn not_found(stream: &mut TcpStream, uri: &str) -> io::Result<()> {
     let body = format!("Resource '{}' not found", uri);
-    let message = format!("HTTP/1.1 404 Not Found\r\n\
-                           Date: {}\r\n\
-                           Connection: close\r\n\
-                           Server: Rust Serv/0.1.1\r\n\
-                           Content-Length: {}\r\n\
-                           \r\n\
-                           {}",
-                          current_time_string(),
-                          body.len(),
-                          body);
-    stream.write(message.as_bytes()).and(Ok(()))
+    try!(respond_header(stream, "404 Not Found", "text/plain", body.len()));
+    stream.write(body.as_bytes()).and(Ok(()))
 }
 
 fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
-    let message = format!("HTTP/1.1 403 Not Permitted\r\n\
-                           Date: {}\r\n\
-                           Connection: close\r\n\
-                           Server: Rust Serv/0.1.1\r\n\
-                           Content-Length: 0\r\n\
-                           \r\n",
-                          current_time_string());
-    stream.write(message.as_bytes()).and(Ok(()))
+    respond_header(stream, "403 Not Permitted", "text/plain", 0)
 }
 
 fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
