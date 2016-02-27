@@ -81,7 +81,7 @@ fn respond_header(stream: &mut TcpStream,
     let message = format!("HTTP/1.1 {status}\r\n\
                            Date: {date}\r\n\
                            Connection: close\r\n\
-                           Server: Rust Serv/0.1.1\r\n\
+                           Server: Rust Serv/0.2\r\n\
                            Allow: GET, HEAD\r\n\
                            Content-Type: {content_type}\r\n\
                            Content-Length: {length}\r\n\
@@ -111,7 +111,7 @@ fn not_permitted(stream: &mut TcpStream) -> io::Result<()> {
     respond_header(stream, "403 Not Permitted", "text/plain", 0)
 }
 
-fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
+fn handle_client(stream: TcpStream, index_name: &str, list_dir: bool) -> Result<(), Box<Error>> {
     try!(stream.set_read_timeout(Some(Duration::from_secs(5))));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -139,13 +139,13 @@ fn handle_client(stream: TcpStream) -> Result<(), Box<Error>> {
     };
 
     let uri = items[1];
-    respond_to(&mut stream, method, uri)
+    respond_to(&mut stream, method, uri, index_name, list_dir)
 }
 
-fn respond_file(mut stream: &mut TcpStream,
+fn respond_file(stream: &mut TcpStream,
+                method: Method,
                 uri: &str,
-                file: &mut File,
-                method: Method)
+                file: &mut File)
                 -> Result<(), Box<Error>> {
     let mut data = Vec::new();
     let length = match method {
@@ -154,17 +154,36 @@ fn respond_file(mut stream: &mut TcpStream,
     };
 
     let content_type = content_type_for(&uri);
-    try!(head(&mut stream, content_type, length));
+    try!(head(stream, content_type, length));
     if method == Method::Get {
         try!(stream.write(&data[..]));
     }
     Ok(())
 }
 
-fn respond_directory(mut stream: &mut TcpStream,
-                     dir: &Path,
-                     method: Method)
-                     -> Result<(), Box<Error>> {
+fn respond_dir(stream: &mut TcpStream,
+               method: Method,
+               dir: &Path,
+               index: &str,
+               list_dir: bool)
+               -> Result<(), Box<Error>> {
+    if index != "" {
+        let uri = dir.join(index);
+        match File::open(&uri) {
+            Ok(mut file) => {
+                try!(respond_file(stream, method, uri.to_str().unwrap(), &mut file));
+                return Ok(());
+            }
+            Err(_) => {}
+        }
+    }
+
+    if !list_dir {
+        try!(not_found(stream, dir.to_str().unwrap()));
+        return Err(From::from(
+            format!("404: {}: No index found and directory listing disabled",
+                    dir.to_str().unwrap())));
+    }
     let members = try!(read_dir(&dir));
     let items = members.filter_map(|file| {
         file.ok().and_then(|file| file.path().to_str().map(String::from))
@@ -182,24 +201,29 @@ fn respond_directory(mut stream: &mut TcpStream,
                           path = dir.to_str().unwrap(),
                           items = items);
 
-    try!(head(&mut stream, "text/html", content.len()));
+    try!(head(stream, "text/html", content.len()));
     if method == Method::Get {
         try!(stream.write(content.as_bytes()));
     }
     Ok(())
 }
 
-fn respond_to(mut stream: &mut TcpStream, method: Method, uri: &str) -> Result<(), Box<Error>> {
+fn respond_to(stream: &mut TcpStream,
+              method: Method,
+              uri: &str,
+              index: &str,
+              list_dir: bool)
+              -> Result<(), Box<Error>> {
     let file = find_file(uri);
     match file {
         Ok(file) => {
             match file {
-                ResponseItem::File(mut file) => respond_file(&mut stream, uri, &mut file, method),
-                ResponseItem::Directory(dir) => respond_directory(&mut stream, &dir, method),
+                ResponseItem::File(mut file) => respond_file(stream, method, uri, &mut file),
+                ResponseItem::Directory(dir) => respond_dir(stream, method, &dir, index, list_dir),
             }
         }
-        Err(UriError::NotFound) => Ok(try!(not_found(&mut stream, uri))),
-        Err(UriError::IllegalPath) => Ok(try!(not_permitted(&mut stream))),
+        Err(UriError::NotFound) => Ok(try!(not_found(stream, uri))),
+        Err(UriError::IllegalPath) => Ok(try!(not_permitted(stream))),
     }
 }
 
@@ -212,6 +236,11 @@ fn main() {
                 "port",
                 "set the port for the server (default 8000)",
                 "PORT");
+    opts.optopt("i",
+                "index",
+                "set the file for the index document (default: index.html)",
+                "FILE");
+    opts.optflag("n", "no-directory", "prevent directories from being listed");
     opts.optflag("h", "help", "print this help menu");
     let matches = opts.parse(&args[1..]).unwrap();
 
@@ -220,15 +249,20 @@ fn main() {
         return;
     }
 
+    let list_directory = !matches.opt_present("n");
     let port = matches.opt_str("p").and_then(|x| x.parse::<i32>().ok()).unwrap_or(8000);
+    let index_name = matches.opt_str("i").unwrap_or("index.html".into());
 
-    let address = format!("127.0.0.1:{}", port);
+    println!("Starting server on localhost:{}", port);
+    let address = format!("localhost:{}", port);
     let listener = TcpListener::bind(&address[..]).unwrap();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let name = index_name.clone();
                 thread::spawn(move || {
-                    handle_client(stream).map_err(|e| println!("{}", e.description()))
+                    handle_client(stream, &name[..], list_directory)
+                        .map_err(|e| println!("{:?}", e))
                 });
             }
             Err(e) => {
