@@ -40,6 +40,8 @@ fn content_type_for(uri: &str) -> &str {
     match Path::new(uri).extension().and_then(|x| x.to_str()) {
         Some("html") | Some("htm") => "text/html",
         Some("json") => "application/json",
+        Some("css") => "text/css",
+        Some("js") => "text/javascript",
         _ => "text/plain",
     }
 }
